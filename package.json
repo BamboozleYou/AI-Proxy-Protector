@@ -1,0 +1,21 @@
+{
+  "name": "ai-proxy-protector",
+  "version": "1.0.0",
+  "description": "",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "setup": "node cert-manager.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "http-proxy-middleware": "^2.0.9",
+    "node-forge": "^1.3.1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
