@@ -1,7 +1,6 @@
-// Load environment variables FIRST - before anything else
+// Load environment variables FIRST
 require('dotenv').config();
 
-// Add debug output
 console.log('🔍 Environment loaded:');
 console.log('API Key exists:', !!process.env.GEMINI_API_KEY);
 console.log('API Key length:', process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.length : 0);
@@ -12,6 +11,8 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
+const net = require('net');
+const url = require('url');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const PIIDetector = require('./pii-detector');
 const CertificateManager = require('./cert-manager');
@@ -21,15 +22,10 @@ class AIProxyProtector {
     this.app = express();
     this.config = this.loadConfig();
     
-    // Debug output for constructor
-    console.log('🔧 Config in constructor:');
-    console.log('geminiApiKey exists:', !!this.config.geminiApiKey);
-    console.log('geminiApiKey length:', this.config.geminiApiKey ? this.config.geminiApiKey.length : 0);
-    console.log('proxyPort:', this.config.proxyPort);
-    console.log('webPort:', this.config.webPort);
+    console.log('🔧 Config loaded:');
+    console.log('API Key exists:', !!this.config.geminiApiKey);
     
     this.piiDetector = new PIIDetector(this.config.geminiApiKey);
-    this.certManager = new CertificateManager();
     this.stats = {
       requestsBlocked: 0,
       requestsAllowed: 0,
@@ -39,23 +35,21 @@ class AIProxyProtector {
     
     this.setupMiddleware();
     this.setupRoutes();
+    
+    this.aiPlatforms = [
+      'chat.openai.com',
+      'claude.ai',
+      'bard.google.com',
+      'copilot.microsoft.com',
+      'gemini.google.com'
+    ];
   }
 
   loadConfig() {
-    const configPath = path.join(__dirname, 'config.json');
-    if (fs.existsSync(configPath)) {
-      const fileConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-      // Always use environment variable for API key if available
-      fileConfig.geminiApiKey = process.env.GEMINI_API_KEY || fileConfig.geminiApiKey || '';
-      return fileConfig;
-    }
-    
-    // Default config
     return {
       geminiApiKey: process.env.GEMINI_API_KEY || '',
       proxyPort: parseInt(process.env.PROXY_PORT) || 8080,
       webPort: parseInt(process.env.WEB_PORT) || 3000,
-      logLevel: 'info',
       aiPlatforms: {
         'chat.openai.com': true,
         'claude.ai': true,
@@ -65,24 +59,14 @@ class AIProxyProtector {
     };
   }
 
-  saveConfig() {
-    fs.writeFileSync(path.join(__dirname, 'config.json'), JSON.stringify(this.config, null, 2));
-  }
-
   setupMiddleware() {
     this.app.use(cors());
     this.app.use(express.json({ limit: '10mb' }));
     this.app.use(express.static('web-interface'));
-    
-    // Request logging
-    this.app.use((req, res, next) => {
-      console.log(`${new Date().toISOString()} ${req.method} ${req.url}`);
-      next();
-    });
   }
 
   setupRoutes() {
-    // Web interface API
+    // API endpoints
     this.app.get('/api/status', (req, res) => {
       res.json({
         status: 'running',
@@ -96,192 +80,253 @@ class AIProxyProtector {
       });
     });
 
-    this.app.post('/api/config', (req, res) => {
-      this.config = { ...this.config, ...req.body };
-      this.saveConfig();
-      
-      // Recreate PII detector with new API key if provided
-      if (req.body.geminiApiKey) {
-        this.piiDetector = new PIIDetector(req.body.geminiApiKey);
-      }
-      
-      res.json({ success: true });
-    });
-
-    // Catch-all proxy handler
-    this.app.use('*', this.createProxyHandler());
-  }
-
-  createProxyHandler() {
-    return async (req, res, next) => {
+    // Regular HTTP proxy for non-AI platforms
+    this.app.use('*', (req, res, next) => {
       const host = req.get('host');
       
+      if (!host) {
+        return res.status(400).send('Bad Request');
+      }
+
       // Check if this is an AI platform
-      const isAIPlatform = Object.keys(this.config.aiPlatforms).some(platform => 
-        host && host.includes(platform) && this.config.aiPlatforms[platform]
-      );
+      const isAIPlatform = this.aiPlatforms.some(platform => host.includes(platform));
 
-      if (!isAIPlatform) {
-        return this.proxyRequest(req, res, host);
-      }
-
-      console.log(`🤖 AI Platform detected: ${host}`);
-
-      // Handle POST requests to chat endpoints
-      if (req.method === 'POST' && this.isChatEndpoint(req.originalUrl)) {
-        await this.handleChatRequest(req, res, host);
+      if (isAIPlatform) {
+        console.log(`🤖 AI Platform detected: ${host}`);
+        return this.handleAIPlatform(req, res, host);
       } else {
-        // Proxy other requests normally
-        this.proxyRequest(req, res, host);
+        // Pass through other websites normally
+        return this.proxyRegularWebsite(req, res, host);
       }
-    };
-  }
-
-  isChatEndpoint(url) {
-    const chatEndpoints = [
-      '/backend-api/conversation', // ChatGPT
-      '/api/organizations/', // Claude
-      '/v1/chat/completions', // Generic OpenAI API
-      '/api/generate' // Other AI platforms
-    ];
-    
-    return chatEndpoints.some(endpoint => url.includes(endpoint));
-  }
-
-  async handleChatRequest(req, res, host) {
-    let body = '';
-    
-    req.on('data', chunk => {
-      body += chunk.toString();
     });
+  }
 
-    req.on('end', async () => {
-      try {
-        const prompt = this.extractPrompt(body, host);
-        
-        if (prompt && prompt.length > 10) { // Skip very short prompts
-          console.log(`📝 Analyzing prompt: "${prompt.substring(0, 50)}..."`);
+  async handleAIPlatform(req, res, host) {
+    // Handle AI platform requests with PII detection
+    if (req.method === 'POST' && this.isChatEndpoint(req.originalUrl)) {
+      let body = '';
+      
+      req.on('data', chunk => {
+        body += chunk.toString();
+      });
+
+      req.on('end', async () => {
+        try {
+          const prompt = this.extractPrompt(body);
           
-          const hasPII = await this.piiDetector.detectPII(prompt);
-          
-          if (hasPII) {
-            this.stats.requestsBlocked++;
-            this.stats.piiDetections++;
+          if (prompt && prompt.length > 10) {
+            console.log(`📝 Analyzing prompt: "${prompt.substring(0, 50)}..."`);
             
-            console.log('🚫 Request blocked - PII detected');
+            const hasPII = await this.piiDetector.detectPII(prompt);
             
-            return res.status(403).json({
-              error: 'PII Detected',
-              message: 'Your request contains personally identifiable information and has been blocked.',
-              suggestion: 'Please remove personal information like names, emails, phone numbers, or addresses.',
-              blocked: true,
-              timestamp: new Date().toISOString()
-            });
+            if (hasPII) {
+              this.stats.requestsBlocked++;
+              this.stats.piiDetections++;
+              
+              console.log('🚫 Request blocked - PII detected');
+              
+              return res.status(403).json({
+                error: 'PII Detected',
+                message: 'Your request contains personally identifiable information and has been blocked.',
+                suggestion: 'Please remove personal information like names, emails, phone numbers, or addresses.',
+                blocked: true
+              });
+            }
           }
-        }
 
-        this.stats.requestsAllowed++;
-        console.log('✅ Request allowed - No PII detected');
-        
-        // Forward the request
-        this.proxyRequestWithBody(req, res, host, body);
-        
-      } catch (error) {
-        console.error('Error processing request:', error);
-        this.stats.requestsAllowed++; // Fail open
-        this.proxyRequestWithBody(req, res, host, body);
+          this.stats.requestsAllowed++;
+          console.log('✅ Request allowed - No PII detected');
+          
+          // Forward the request if no PII
+          this.forwardRequest(req, res, host, body);
+          
+        } catch (error) {
+          console.error('Error processing AI request:', error);
+          this.forwardRequest(req, res, host, body);
+        }
+      });
+    } else {
+      // Non-chat requests to AI platforms - pass through
+      this.proxyRegularWebsite(req, res, host);
+    }
+  }
+
+  proxyRegularWebsite(req, res, host) {
+    const isHttps = req.connection.encrypted;
+    const target = `${isHttps ? 'https' : 'http'}://${host}`;
+    
+    const proxy = createProxyMiddleware({
+      target,
+      changeOrigin: true,
+      secure: false,
+      onError: (err, req, res) => {
+        console.error('Proxy error:', err.message);
+        if (!res.headersSent) {
+          res.status(500).send('Proxy error');
+        }
       }
     });
-  }
-
-  extractPrompt(body, host) {
-    try {
-      const data = JSON.parse(body);
-      
-      // ChatGPT format
-      if (data.messages && Array.isArray(data.messages)) {
-        const lastMessage = data.messages[data.messages.length - 1];
-        return lastMessage?.content || '';
-      }
-      
-      // Claude format
-      if (data.prompt) {
-        return data.prompt;
-      }
-      
-      // Generic formats
-      if (data.input) return data.input;
-      if (data.text) return data.text;
-      if (data.query) return data.query;
-      
-    } catch (error) {
-      // Not JSON, try to extract text
-      return body.substring(0, 1000); // First 1000 chars
-    }
     
-    return '';
+    proxy(req, res);
   }
 
-  proxyRequestWithBody(req, res, host, body) {
+  forwardRequest(req, res, host, body) {
     const target = `https://${host}`;
     
     const proxy = createProxyMiddleware({
       target,
       changeOrigin: true,
       secure: false,
-      onProxyReq: (proxyReq, req, res) => {
-        if (body) {
+      onProxyReq: (proxyReq) => {
+        if (body && req.method === 'POST') {
           proxyReq.setHeader('Content-Length', Buffer.byteLength(body));
           proxyReq.write(body);
         }
       },
       onError: (err, req, res) => {
-        console.error('Proxy error:', err);
-        res.status(500).json({ error: 'Proxy error' });
+        console.error('Proxy forward error:', err.message);
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Proxy error' });
+        }
       }
     });
     
     proxy(req, res);
   }
 
-  proxyRequest(req, res, host) {
-    const target = `https://${host}`;
+  isChatEndpoint(url) {
+    const chatEndpoints = [
+      '/backend-api/conversation',
+      '/api/organizations/',
+      '/v1/chat/completions',
+      '/api/generate'
+    ];
     
-    const proxy = createProxyMiddleware({
-      target,
-      changeOrigin: true,
-      secure: false,
-      onError: (err, req, res) => {
-        console.error('Proxy error:', err);
-        res.status(500).json({ error: 'Proxy error' });
-      }
-    });
-    
-    proxy(req, res);
+    return chatEndpoints.some(endpoint => url.includes(endpoint));
   }
 
- async start() {
-  // Start web interface
-  this.app.listen(this.config.webPort, '0.0.0.0', () => {
-    console.log(`🌐 Web interface: http://localhost:${this.config.webPort}`);
-  });
+  extractPrompt(body) {
+    try {
+      const data = JSON.parse(body);
+      
+      if (data.messages && Array.isArray(data.messages)) {
+        const lastMessage = data.messages[data.messages.length - 1];
+        return lastMessage?.content || '';
+      }
+      
+      if (data.prompt) return data.prompt;
+      if (data.input) return data.input;
+      if (data.text) return data.text;
+      
+    } catch (error) {
+      return body.substring(0, 1000);
+    }
+    
+    return '';
+  }
 
-  // Start HTTP proxy server for testing
-  http.createServer(this.app).listen(this.config.proxyPort, '0.0.0.0', () => {
-    console.log(`🔗 HTTP Proxy running on port: ${this.config.proxyPort}`);
-    console.log(`📊 Dashboard: http://localhost:${this.config.webPort}`);
-    this.printMacOSProxyInstructions();
-  });
-}
+  // Handle HTTPS CONNECT requests for SSL tunneling
+  handleConnect(req, clientSocket, head) {
+    const { hostname, port } = url.parse(`http://${req.url}`);
+    const isAIPlatform = this.aiPlatforms.some(platform => hostname.includes(platform));
+    
+    if (isAIPlatform) {
+      console.log(`🔐 HTTPS CONNECT to AI platform: ${hostname}`);
+      // For AI platforms, we need to intercept with our certificate
+      this.handleAIConnect(req, clientSocket, head, hostname, port);
+    } else {
+      // For regular websites, create normal tunnel
+      this.handleRegularConnect(req, clientSocket, head, hostname, port);
+    }
+  }
 
-  printMacOSProxyInstructions() {
-    console.log('\n📋 macOS PROXY SETUP:');
-    console.log('1. System Preferences → Network');
-    console.log('2. Select your connection → Advanced → Proxies');
-    console.log('3. Check "Web Proxy (HTTP)" and "Secure Web Proxy (HTTPS)"');
-    console.log(`4. Server: 127.0.0.1, Port: ${this.config.proxyPort}`);
-    console.log('5. Click OK and Apply');
-    console.log('\n🧪 TEST: Visit ChatGPT and try entering an email address\n');
+  handleAIConnect(req, clientSocket, head, hostname, port) {
+    // Load our certificate for this AI platform
+    const certPath = path.join(__dirname, 'certificates', `${hostname}.crt`);
+    const keyPath = path.join(__dirname, 'certificates', `${hostname}.key`);
+    
+    if (!fs.existsSync(certPath) || !fs.existsSync(keyPath)) {
+      console.error(`❌ No certificate found for ${hostname}`);
+      clientSocket.end('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+      return;
+    }
+
+    // Send successful CONNECT response
+    clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+
+    // Create HTTPS server with our certificate
+    const options = {
+      cert: fs.readFileSync(certPath),
+      key: fs.readFileSync(keyPath)
+    };
+
+    const httpsServer = https.createServer(options, this.app);
+    
+    // Handle the TLS connection
+    const tlsSocket = new require('tls').TLSSocket(clientSocket, {
+      isServer: true,
+      server: httpsServer,
+      ...options
+    });
+
+    httpsServer.emit('connection', tlsSocket);
+  }
+
+  handleRegularConnect(req, clientSocket, head, hostname, port) {
+    // Create direct tunnel for regular websites
+    const serverSocket = net.connect(port || 443, hostname, () => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      serverSocket.write(head);
+      serverSocket.pipe(clientSocket);
+      clientSocket.pipe(serverSocket);
+    });
+
+    serverSocket.on('error', (err) => {
+      console.error(`Tunnel error for ${hostname}:`, err.message);
+      clientSocket.end();
+    });
+
+    clientSocket.on('error', (err) => {
+      console.error('Client socket error:', err.message);
+      serverSocket.end();
+    });
+  }
+
+  async start() {
+    // Start web interface
+    this.app.listen(this.config.webPort, '0.0.0.0', () => {
+      console.log(`🌐 Web interface: http://localhost:${this.config.webPort}`);
+    });
+
+    // Create HTTP proxy server
+    const httpServer = http.createServer(this.app);
+    
+    // Handle HTTPS CONNECT requests
+    httpServer.on('connect', (req, clientSocket, head) => {
+      this.handleConnect(req, clientSocket, head);
+    });
+
+    httpServer.listen(this.config.proxyPort, '0.0.0.0', () => {
+      console.log('\n🛡️  AI Proxy Protector Started!');
+      console.log(`🔗 HTTP/HTTPS Proxy running on port: ${this.config.proxyPort}`);
+      console.log(`📊 Dashboard: http://localhost:${this.config.webPort}`);
+      
+      if (!this.config.geminiApiKey) {
+        console.log('⚠️  No Gemini API key configured');
+      }
+      
+      this.printSetupInstructions();
+    });
+  }
+
+  printSetupInstructions() {
+    console.log('\n📋 SETUP INSTRUCTIONS:');
+    console.log('1. ✅ CA certificate should be installed');
+    console.log('2. ✅ Set system proxy to: 127.0.0.1:' + this.config.proxyPort);
+    console.log('3. ✅ API key configured');
+    console.log('4. 🧪 Test: Visit any website (should work normally)');
+    console.log('5. 🧪 Test: Visit ChatGPT and try entering an email address (should be blocked)');
+    console.log('\n🔧 To disable proxy: System Preferences → Network → Proxies → Uncheck boxes\n');
   }
 }
 
