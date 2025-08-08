@@ -122,7 +122,7 @@ class AIProxyProtector {
       );
 
       if (!isAIPlatform) {
-        return res.status(404).json({ error: 'Not an AI platform' });
+        return this.proxyRequest(req, res, host);
       }
 
       console.log(`🤖 AI Platform detected: ${host}`);
@@ -260,38 +260,19 @@ class AIProxyProtector {
     proxy(req, res);
   }
 
-  async start() {
-    // Start web interface
-    this.app.listen(this.config.webPort, '0.0.0.0', () => {
-      console.log(`🌐 Web interface: http://localhost:${this.config.webPort}`);
-    });
+ async start() {
+  // Start web interface
+  this.app.listen(this.config.webPort, '0.0.0.0', () => {
+    console.log(`🌐 Web interface: http://localhost:${this.config.webPort}`);
+  });
 
-    // Start HTTPS proxy
-    const certPath = path.join(__dirname, 'certificates', 'chat.openai.com.crt');
-    const keyPath = path.join(__dirname, 'certificates', 'chat.openai.com.key');
-    
-    if (!fs.existsSync(certPath) || !fs.existsSync(keyPath)) {
-      console.error('❌ Certificates not found. Run: npm run setup');
-      return;
-    }
-
-    const options = {
-      cert: fs.readFileSync(certPath),
-      key: fs.readFileSync(keyPath)
-    };
-
-    https.createServer(options, this.app).listen(this.config.proxyPort, '0.0.0.0', () => {
-      console.log('\n🛡️  AI Proxy Protector Started!');
-      console.log(`📊 Dashboard: http://localhost:${this.config.webPort}`);
-      console.log(`🔒 Proxy running on port: ${this.config.proxyPort}`);
-      
-      if (!this.config.geminiApiKey) {
-        console.log('⚠️  No Gemini API key found in .env file');
-      }
-      
-      this.printMacOSProxyInstructions();
-    });
-  }
+  // Start HTTP proxy server for testing
+  http.createServer(this.app).listen(this.config.proxyPort, '0.0.0.0', () => {
+    console.log(`🔗 HTTP Proxy running on port: ${this.config.proxyPort}`);
+    console.log(`📊 Dashboard: http://localhost:${this.config.webPort}`);
+    this.printMacOSProxyInstructions();
+  });
+}
 
   printMacOSProxyInstructions() {
     console.log('\n📋 macOS PROXY SETUP:');
